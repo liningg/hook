@@ -1,0 +1,128 @@
+　　前面的项目用到hook 还是在半年前，没想到最近有用到了，说实话，在项目组就提出，能用别的办法还是不要用这种，毕竟不太正道（感觉哈）。
+
+　　最近又牵扯到第三方对接的任务，没办法我又回到了HOOK上了。与窗口有关系，想在第三方界面弹出窗口的时候通知我。所以第一时间想到了CreateWindow,能不能勾住这个API 不就大事解决了吗，但是这次这个的难度，超出了我的想象，windwos 的窗口并不像他的库那么好用，那么单纯。我用CreateWindow竟然没有够到Dialog。最后好不容易够到了，竟然给我来了参数name 是MSCTFIME 之类的名字，可我的对话框根本不是这个名字。说真的就这个问题我真的想了好久，查了好久，最后发现，Dialog 竟然不调用CreateWindowEx 着实让我大吃一惊。
+
+引用 http://bbs.csdn.net/topics/360133376 里 aiwnx的分析
+
+CreateWindowExW -> _CreateWindowEx -> VerNtUserCreateWindowEx -> (kernel: 0x157:NtUserCreateWindowEx)
+CreateWindowExA -> _CreateWindowEx -> VerNtUserCreateWindowEx -> (kernel: 0x157:NtUserCreateWindowEx)
+DialogBoxParam -> DialogBoxIndirectParamAorW -> InternalDialogBox -> InternalCreateDialog -> VerNtUserCreateWindowEx -> (kernel: 0x157:NtUserCreateWindowEx)
+CreateDialogParam -> CreateDialogIndirectParamAorW -> InternalCreateDialog ->  VerNtUserCreateWindowEx -> (kernel: 0x157:NtUserCreateWindowEx)
+　　看到这个，当时大喜，或许可以勾住这个API ，再一次失望，windows 接口里，没有找到这个API 。
+
+　　所以看来勾API 这个方式可能不能用在这个地方。想到之前做HOOK的时候还有钩子就是 SetWindowHookEx,这个东西，是用来勾住消息的。或者这个时候可以派上用场。
+
+WINUSERAPI
+HHOOK
+WINAPI
+SetWindowsHookExA(
+    __in int idHook,
+    __in HOOKPROC lpfn,
+    __in_opt HINSTANCE hmod,
+    __in DWORD dwThreadId);
+　　这个函数的第一个参数就是消息的类型，在这里不介绍这些了，网上真的是一大把。当时我选取了WH_CALLPROC 这个消息。用来获取窗口的创建消息。大喜，果然有用。但是出现的问题是，MFC QT  WPF 这个消息的响应并不一样。问题出在哪里呢，。对于QT WPF来说，控件没有句柄这一说。所以我们没有办法获取他里面的控件。不过这个问题并不大。即使控件不响应，索性窗口还是响应的。记得当时在WM_NCREATE这个消息获取窗口创建，句柄，然后在这个 WM_SHOWWINDOW的响应里根据这个句柄进行查找。并发返回窗口大小位置等信息。当然这个过程中会出现，一个窗口WM_NCREATE消息会被调用多次的问题。最终我是用逻辑判断的。
+
+LRESULT CALLBACK OnWndProc(int code,WPARAM wParam,LPARAM lParam)
+{
+	 CWPSTRUCT *pCwp = reinterpret_cast<CWPSTRUCT*>(lParam);  
+	 switch(pCwp->message)
+	 {
+	 case WM_CREATE:
+		 {
+			 break;
+		 }
+	 case WM_SHOWWINDOW:
+		 {
+			 HWND hwnd = reinterpret_cast<HWND>((pCwp->hwnd)); 
+
+			 map<int,int>::iterator it = mapHandle.find((int)hwnd);
+			 if(it != mapHandle.end()){
+				 PostMessage(hInterhwnd,WM_INJECT_SHOWWINDOW,(WPARAM)hwnd,0);
+				 LPRECT lpRect;
+				 lpRect = (LPRECT)malloc(sizeof(tagRECT));
+				 ::GetWindowRect(hwnd,lpRect);
+				 FILE * fp = fopen("f:\\abc.txt","a+");
+				 if(fp){
+					 char buff[1000] = {0};
+					 sprintf(buff,"showwindow msg point left = %d,top = %d,right = %d,bottom = %d,handle = 0x%x type = %d map = %d\n",lpRect->left,lpRect->top,lpRect->right,lpRect->bottom,hwnd,nCreateMsgNumber[wndType],mapHandle.size() );
+					 fwrite(buff,strlen(buff),1,fp);
+					 fclose(fp);
+				 }
+				 mapHandle.clear();
+			 }
+			 break;
+		 }
+	 case WM_CLOSE:
+		 {
+			 HWND hwnd = reinterpret_cast<HWND>((pCwp->hwnd)); 
+			 PostMessage(hInterhwnd,WM_INJECT_CLOSE,(WPARAM)hwnd,0);
+			 LPRECT lpRect;
+			 lpRect = (LPRECT)malloc(sizeof(tagRECT));
+			 ::GetWindowRect(hwnd,lpRect);
+			 FILE * fp = fopen("f:\\abc.txt","a+");
+			 if(fp){
+
+				 char buff[1000] = {0};
+				 sprintf(buff,"close msg point left = %d,top = %d,right = %d,bottom = %d,handle = 0x%x\n",lpRect->left,lpRect->top,lpRect->right,lpRect->bottom,hwnd);
+				 fwrite(buff,strlen(buff),1,fp);
+				 fclose(fp);
+			 }
+			 mapHandle.clear();
+			 break;
+		 }
+	 case WM_NCCREATE:
+		 {
+			 HWND hwnd = reinterpret_cast<HWND>((pCwp->hwnd)); 
+			 //mapHandle.insert(make_pair((int)hwnd,0));
+			 LPRECT lpRect;
+			 lpRect = (LPRECT)malloc(sizeof(tagRECT));
+			 ::GetWindowRect(hwnd,lpRect);
+			 if(lpRect->right - lpRect->left != 0){
+				 if(mapHandle.size() < nCreateMsgNumber[wndType]){
+					 mapHandle.insert(make_pair((int)hwnd,0));
+					 FILE * fp = fopen("f:\\abc.txt","a+");
+					 if(fp){
+
+						 char buff[1000] = {0};
+						 sprintf(buff,"createwindow msg point left = %d,top = %d,right = %d,bottom = %d,handle = 0x%x type = %d map = %d\n",lpRect->left,lpRect->top,lpRect->right,lpRect->bottom,hwnd,nCreateMsgNumber[wndType],mapHandle.size() );
+						 fwrite(buff,strlen(buff),1,fp);
+						 fclose(fp);
+					 }
+				 }
+
+			 }
+			 break;
+		 }
+
+	 default:
+		 {
+			 break;
+		 }
+
+	 }
+	return CallNextHookEx(hooker,code,wParam,lParam);
+}
+
+
+extern "C" __declspec(dllexport) int SetHook(HWND hwnd,int threadid,int wndtype)
+{
+	hInterhwnd = hwnd;
+	wndType = (WINDOW_TYPE)wndtype;
+	mapHandle.clear();
+	hooker = SetWindowsHookEx(WH_CALLWNDPROC,OnWndProc,hinst,threadid);
+	if(hooker == NULL){
+		return 0;
+	}
+	return 1;
+}
+extern "C" __declspec(dllexport) int UnHook()
+{
+	mapHandle.clear();
+	UnhookWindowsHookEx(hooker);
+	return 1;
+}
+　　
+
+　　哈哈哈，纠结了我好长时间的问题，终于解决，圆满。当然项目还没有解决，这个只是解决了其中一个问题。
+
+　　

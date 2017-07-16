@@ -1,0 +1,202 @@
+　　钩子(Hook)，是Windows消息处理机制的一个平台，应用程序可以在上面设置子程以监视指定窗口的某种消息，而且所监视的窗口可以是其他进程所创建的。当消息到达后，在目标窗口处理函数之前处理它。钩子机制允许应用程序截获处理window消息或特定事件。总感觉这是windows留下来的应用程序的后门之类的吧。
+
+　　第一次接触这个，是刚来新公司，领导给了我一个任务，需要监听另外一个系统从串口获取的数据，之前也做过一些串口编程之类的。经过长时间的调研（google）,才知道串口是独占的，虽然CreateFile 有参数是否独占，但是windows 规定串口只能独占，所以即使你设置共享模式，也没用。这就有问题了，人家CNS系统在占用串口，我怎么用。当时查询资料说是用钩子，但是查了好久，网上大都是不是勾键盘，就是勾MessageBox。机制如我，想到了既然可以勾MessageBox ,那就一定能勾住ReadFile,这两货都是windows API 。 所以当时就这么干了。
+
+　　网上有很多方法，有的需要更改导入表之类的，太高深了，幸好微软自己提供了专门的库叫Detours，这个东西就可以勾住任何的windows API ,大喜，经过测试之后，果然可以。不过又有了新问题，我需要注入到其他应用程序啊，怎么办，有个CreateRemoteThread这个函数可以做到，从字面意思看，就是创建一个远程线程，又喜，开始埋头找这个函数的用法之类的，当然中途也遇到了诸如提权 之类的新问题。不过Google是个好东西。不过这种方式呢需要将我们的程序封装成dll的形式，然后才能加载。
+
+BOOL EnableDebugPrivilege();
+DWORD GetTargetProcessID(const char *processExeName)  
+{  
+    if(!EnableDebugPrivilege()){
+        printf("EnableDebugPrivilege faild\n");
+    }
+    if (processExeName == NULL) {  
+        return 0;  
+    }  
+
+    HANDLE hSnapshot;  
+
+    hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);  
+    if (INVALID_HANDLE_VALUE == hSnapshot) {  
+        printf("%d\n", GetLastError());  
+        return 0;  
+    }  
+
+    PROCESSENTRY32 pe;  
+    BOOL bRet = FALSE;  
+
+    pe.dwSize = sizeof (PROCESSENTRY32);  
+    bRet = Process32First(hSnapshot, &pe);  
+    while (bRet) {  
+        _bstr_t b(pe.szExeFile);
+        const char* c = b;
+        if (strstr(processExeName, c)) {  
+            return pe.th32ProcessID;  
+        } else {  
+            ZeroMemory(&pe, sizeof (PROCESSENTRY32));  
+            pe.dwSize = sizeof (PROCESSENTRY32);  
+            bRet = Process32Next(hSnapshot, &pe);  
+        }  
+    }  
+
+    return 0;  
+}  
+BOOL  EnableDebugPrivilege()
+{
+    HANDLE hSnap;
+    HANDLE hkernel32 = NULL;    //被注入进程的句柄
+    PROCESSENTRY32 pe; 
+    BOOL bNext;
+    HANDLE hToken;
+    TOKEN_PRIVILEGES tp;
+    LUID Luid;
+    LPVOID p;
+    FARPROC pfn;
+    if (!OpenProcessToken(GetCurrentProcess(),TOKEN_ALL_ACCESS_P,&hToken))
+    {
+        printf("Warning:提升权限失败\n");
+        system("pause");
+        return 0;
+    }
+
+    if (!LookupPrivilegeValue(NULL,SE_DEBUG_NAME,&Luid))
+    {
+        printf("Warning:提升权限失败\n");
+        system("pause");
+        return 0;
+    }
+
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    tp.Privileges[0].Luid = Luid;
+
+    if (!AdjustTokenPrivileges(hToken,0,&tp,sizeof(TOKEN_PRIVILEGES),NULL,NULL))
+    {
+        printf("Warning:提升权限失败\n");
+        system("pause");
+        return 0;
+    }
+    return 1;
+}
+BOOL InjectDll(const char *DllFullPath, const DWORD dwRemoteProcessId)  
+{  
+    if (DllFullPath == NULL) {  
+        return FALSE;  
+    }  
+    if (dwRemoteProcessId <= 0) {  
+        return FALSE;  
+    }  
+    HANDLE hRemoteProcess;  
+
+    hRemoteProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, dwRemoteProcessId);  
+    if (NULL == hRemoteProcess) {  
+        printf("Warning:OpenProcess:%d\n", GetLastError());  
+        return FALSE;  
+    }  
+
+    char *pRemoteAddr;  
+    int len = strlen(DllFullPath) + 1;  
+    pRemoteAddr = (char *)VirtualAllocEx(hRemoteProcess, NULL, len, MEM_COMMIT, PAGE_READWRITE);  
+    if (NULL == pRemoteAddr) {  
+        printf("Warning:VirtualAllocEx:%d\n", GetLastError());  
+        goto error;  
+    }  
+
+    if (!WriteProcessMemory(hRemoteProcess, pRemoteAddr, DllFullPath, len, NULL)) {  
+        printf("Warning:WriteProcessMemory:%d\n", GetLastError());  
+        goto error;  
+    }  
+
+    HMODULE hModule;  
+    char LoadLibraryA[] = "LoadLibraryA";  
+
+    hModule = GetModuleHandle("kernel32.dll");  
+
+    FARPROC LoadLibraryAAddr;  
+    LoadLibraryAAddr = GetProcAddress(hModule, LoadLibraryA);  
+    if (NULL == LoadLibraryAAddr) {  
+        printf("Warning:GetProcAddress:%d\n", GetLastError());  
+        goto error;  
+    }  
+
+    HANDLE remoteThread;  
+    remoteThread = CreateRemoteThread(hRemoteProcess, NULL, 0, (LPTHREAD_START_ROUTINE)LoadLibraryAAddr, pRemoteAddr, 0, NULL);  
+    if (NULL == remoteThread) {  
+        printf("Warning:CreateRemoteThread:%d\n", GetLastError());  
+        goto error;  
+    }  
+
+    WaitForSingleObject(hRemoteProcess, INFINITE);  
+    VirtualFreeEx(hRemoteProcess, pRemoteAddr, len, MEM_DECOMMIT);  
+
+    CloseHandle(hRemoteProcess);  
+    CloseHandle(remoteThread);  
+    return TRUE;  
+
+error:  
+    CloseHandle(hRemoteProcess);  
+    return FALSE;  
+}  
+　　这样我们就可以在远程应用程序中加载我们自己的动态库，加载动态库之后，我们当然需要建立我们自己的线程之类的，让我们的服务跑起来。这个时候，就可以用到微软的库了，不过微软的库也只限于32位应用程序，对于64位应用程序听说是收费的。9999美元呐！！！哈哈 不过这就够了，幸好客户是xp系统。
+
+// InjectDll.cpp : Defines the exported functions for the DLL application.
+//
+
+#include "stdafx.h"
+#include "Detours.h"
+#include <stdio.h>
+#include <iostream>
+
+#pragma comment(lib,"Detours.lib")
+
+//修改MessageBoxW 的响应函数
+static   int  (WINAPI *  OLD_MessageBoxW)(HWND hWnd,LPCWSTR lpText,LPCWSTR lpCaption,UINT uType)  =  MessageBoxW;
+int  WINAPI NEW_MessageBoxW(HWND hWnd,LPCWSTR lpText,LPCWSTR lpCaption,UINT uType)
+{
+    // 修改输入参数，调用原函数 
+    int  ret  =  OLD_MessageBoxW(hWnd,L" 输入参数已修改 " ,L" [测试] " ,uType);
+    return  ret;
+}
+
+//修改MessageBoxA的响应函数
+static   int  (WINAPI *  OLD_MessageBoxA)( __in_opt HWND hWnd,
+    __in_opt LPCSTR lpText,
+    __in_opt LPCSTR lpCaption,
+    __in UINT uType)  =  MessageBoxA;
+int WINAPI NEW_MessageBoxA(HWND hWnd,LPCWSTR lpText,LPCWSTR lpCaption,UINT uType)
+{
+    int  ret  =  OLD_MessageBoxA(hWnd," 输入参数已修改 " ," [测试] " ,uType);
+    return ret;
+}
+
+VOID Hook()
+{
+    DetourRestoreAfterWith();
+    DetourTransactionBegin();
+    DetourUpdateThread(GetCurrentThread());
+
+    // 这里可以连续多次调用DetourAttach，表明HOOK多个函数 
+    DetourAttach( & (PVOID & )OLD_MessageBoxA,NEW_MessageBoxA);
+    DetourAttach( & (PVOID & )OLD_MessageBoxW,NEW_MessageBoxW);
+
+
+    DetourTransactionCommit();
+}
+
+VOID UnHook()
+{
+    DetourTransactionBegin();
+    DetourUpdateThread(GetCurrentThread());
+
+    // 这里可以连续多次调用DetourDetach,表明撤销多个函数HOOK 
+    DetourDetach( & (PVOID & )OLD_MessageBoxA,NEW_MessageBoxA);
+    DetourDetach( & (PVOID & )OLD_MessageBoxW,NEW_MessageBoxW);
+
+    DetourTransactionCommit();
+
+}
+　　之前勾ReadFile的程序没找见，不过都一样了。不过需要注意的一点就是，当接收到数据之后，需要立马吧数据保存起来，然后马上返回，不可做太多逻辑，因为会影响第三方应用程序。之后，就可以在我们自己的线程里处理这些数据了。为了达到我的目的，当我是在线程里创建里socket 服务器，当有客户端连接进来，就把数据传出去。虽然这样做也不是很好，但是时间也比较紧，就这样做了。考虑到性能问题，千万不能把原程序给人家崩溃了。这个程序跑了整整两天，监听串口数据，居然正常运行了两天。不过呢，任务也算完成了。哈哈哈。又掌握了一种新的软件运行方式。给自己点个赞！！ 
+
+　　最近64位的Detour 居然也被我找见了。win7 64位也测试成功！！！
+
+ 
